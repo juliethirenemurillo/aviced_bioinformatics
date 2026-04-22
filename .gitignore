@@ -1,0 +1,25 @@
+# large data files
+*.fastq
+*.fastq.gz
+*.bam
+*.bam.bai
+*.fasta
+*.fa
+*.gz
+*.sam
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# system files
+.DS_Store
+
+# results that can be regenerated
+results/
