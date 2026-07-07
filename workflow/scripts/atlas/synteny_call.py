@@ -88,7 +88,10 @@ def load_orthologs(path, species, protein_map=None):
                 m[r["human_gene"]] = None
                 continue
             # try protein map first (resolves LOC genes)
-            blast_acc = r.get("blast_bird_gene", "") or ""
+            # v3 schema uses blast_forward_top_hit; older v2 used blast_bird_gene
+            blast_acc = (r.get("blast_forward_top_hit", "")
+                         or r.get("blast_bird_gene", "")
+                         or "")
             if blast_acc:
                 clean_acc = strip_ref(blast_acc)
                 if clean_acc in protein_map:

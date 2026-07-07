@@ -1,255 +1,234 @@
 #!/usr/bin/env python
 """
-flanker_orthologs.py  --  AviCeD synteny step (module B: ortholog reconciler)
+flanker_orthologs.py  --  AviCeD synteny step (reconciler, v3)
 
-Merges two pre-computed ortholog tables for each flanker gene and reports
-per-(flanker, species) concordance. Output drives the synteny_call step:
-which bird gene to use as the anchor for the flanker, and how confident.
+Reconciles three sources of evidence for each (flanker, species) pair:
+  1. Compara orthology (Ensembl tree-based)
+  2. blastp top forward hit (with reciprocal-or-paralog flag)
+  3. tblastn against bird genome (catches unannotated genes)
 
-Why two tables:
-  Compara  -- Ensembl's tree-based orthology (good for housekeeping flankers;
-              not available for non-Ensembl assemblies, e.g. duck T2T).
-  RBB BLAST -- Reciprocal Best BLAST hits (works on any proteome you have,
-              including T2T; weaker on paralog-rich families).
+This v3 lets us accept paralogs as POSITIONAL flankers for synteny --
+they're "the gene at the right place even if it's the wrong sister-gene
+family member" -- which is what we actually need for the synteny step.
+For target genes (the 8 we're investigating), strict reciprocity matters;
+for flankers, position matters.
 
-The two are complementary, not redundant:
-  - Where both cover (chicken, duck ZJU1.0): concordance = methods cross-check.
-  - Where only RBB covers (duck T2T): RBB is the only signal; we mark it so.
+Input schemas:
+  compara.tsv: human_gene, species, bird_gene, ortholog_type, identity
+  blast_v3.tsv: human_gene, species,
+                forward_top_hit, forward_pident, forward_evalue, forward_qcov,
+                reverse_symbol, reciprocal_match,
+                tblastn_seqid, tblastn_pident, tblastn_evalue, tblastn_qcov
 
-INPUT TSVs (both required; either may be empty/missing rows are fine):
-  --compara  human_gene  species  bird_gene  ortholog_type  identity
-  --blast    human_gene  species  bird_gene  identity       evalue   qcov
+Output schema (richer than v2):
+  human_gene, species,
+  compara_bird_gene, compara_type, compara_identity,
+  blast_forward_top_hit, blast_forward_pident, blast_forward_qcov,
+  blast_reverse_symbol, blast_reciprocal,
+  tblastn_seqid, tblastn_pident,
+  concordance, use_for_synteny, reason
 
-Species labels pass through verbatim (whatever you use in the input -- e.g.
-'chicken', 'duck_ZJU1.0', 'duck_T2T' -- shows up in the output).
+Concordance categories:
+  AGREE              compara + blastp_reciprocal both return same gene
+  CONCORDANT         compara + blastp_reciprocal both return (different namespaces)
+  COMPARA_ONLY       compara has ortholog, no blastp reciprocal
+  RECIPROCAL_ONLY    blastp reciprocal, no compara
+  PARALOG_FLANKER    blastp returns paralog (not reciprocal); usable as positional flanker
+  GENOME_HIT         tblastn found a hit in genome (unannotated gene)
+  NO_ORTHOLOG        no evidence anywhere
 
-OUTPUT TSV: one row per (human_gene, species) seen in either input.
-Columns:
-  human_gene  species
-  compara_bird_gene  compara_type  compara_identity
-  blast_bird_gene    blast_identity  blast_evalue  blast_qcov
-  concordance        use_for_synteny  reason
+use_for_synteny decision rule:
+  AGREE / CONCORDANT one2one / many2one     -> Compara bird_gene
+  AGREE / CONCORDANT one2many / many2many   -> Compara bird_gene, flagged *
+  COMPARA_ONLY one2one / many2one           -> Compara bird_gene
+  COMPARA_ONLY one2many / many2many         -> Compara bird_gene, flagged *
+  RECIPROCAL_ONLY                           -> blast_forward_top_hit
+  PARALOG_FLANKER                           -> blast_forward_top_hit, flagged ~paralog
+  GENOME_HIT                                -> SKIP (synteny module can't use coord-only yet)
+  NO_ORTHOLOG                               -> SKIP
 
-Concordance categories (the actual decision logic):
-  AGREE          both methods return the same bird gene (same ID -- rare; same namespace)
-  CONCORDANT     both methods return a hit but different namespaces (Ensembl vs RefSeq)
-                 -- the normal case when both Compara and RBB succeed
-  COMPARA_ONLY   Compara has an ortholog, RBB doesn't
-  BLAST_ONLY     RBB has a hit, Compara doesn't (e.g. T2T, or paralog-rich flanker)
-  NO_ORTHOLOG    neither method found a bird ortholog
-  NO_DATA_*      input table did not cover this (species, gene) pair
-
-use_for_synteny decision rule (which bird gene to anchor on in synteny step):
-  AGREE / CONCORDANT + one2one           -> Compara gene (Ensembl ID; canonical for Ensembl GFFs)
-  CONCORDANT + one2many/many2many        -> Compara gene, flagged *
-  COMPARA_ONLY + one2one                 -> Compara gene
-  COMPARA_ONLY + one2many/many2many      -> Compara gene, flagged *
-  BLAST_ONLY                             -> BLAST gene (RefSeq; used for T2T)
-  NO_ORTHOLOG                            -> SKIP
-
-Note on namespaces:
-  Compara returns Ensembl stable IDs (ENSGALG..., ENSAPLG...).
-  RBB BLAST returns RefSeq accessions (ref|XP_...|, ref|NP_...|).
-  These never match by string. CONCORDANT means both independently found an
-  ortholog at this locus -- not that they returned identical IDs.
-
-Stdlib only. No network. Unit-testable on mock TSVs.
+Reciprocity is checked by SwissProt GN= symbol match, requiring exact gene
+symbol equality. Paralog hits are detected by reciprocal_match=NO with a
+non-empty reverse_symbol.
 """
+
 import argparse, csv, sys
-from collections import defaultdict
 
 
-# ---------- input parsing ----------
+def normalise_compara_type(t):
+    """Strip 'ortholog_' prefix Ensembl REST uses (e.g. 'ortholog_one2one' -> 'one2one')."""
+    return (t or '').replace('ortholog_', '')
 
-def _read_tsv(path, required_cols):
-    """Read a TSV with a header; return list of dict rows. Tolerant to extra cols."""
-    if path is None:
-        return []
-    rows = []
+
+COMPARA_HIGH_CONF = {'one2one', 'many2one'}
+COMPARA_LOW_CONF = {'one2many', 'many2many'}
+
+
+def load_compara(path):
+    """{(human_gene, species): row}"""
+    if not path:
+        return {}
+    out = {}
     with open(path) as fh:
-        rdr = csv.DictReader(fh, delimiter="\t")
-        missing = [c for c in required_cols if c not in (rdr.fieldnames or [])]
-        if missing:
-            sys.exit(f"ERROR: {path} missing required column(s): {missing}")
-        for r in rdr:
-            rows.append({k: (v.strip() if isinstance(v, str) else v) for k, v in r.items()})
-    return rows
-
-
-def index_compara(rows):
-    """{(human_gene, species): {'bird_gene','type','identity'}}  --  first row wins per key."""
-    idx = {}
-    for r in rows:
-        key = (r["human_gene"], r["species"])
-        idx.setdefault(key, {
-            "bird_gene": r.get("bird_gene", "") or "",
-            "type":      r.get("ortholog_type", "") or "",
-            "identity":  r.get("identity", "") or "",
-        })
-    return idx
-
-
-def index_blast(rows):
-    """{(human_gene, species): {'bird_gene','identity','evalue','qcov'}}"""
-    idx = {}
-    for r in rows:
-        key = (r["human_gene"], r["species"])
-        idx.setdefault(key, {
-            "bird_gene": r.get("bird_gene", "") or "",
-            "identity":  r.get("identity", "") or "",
-            "evalue":    r.get("evalue", "") or "",
-            "qcov":      r.get("qcov", "") or "",
-        })
-    return idx
-
-
-# ---------- concordance + decision ----------
-
-def classify(comp, blast):
-    """Return (concordance, use_for_synteny, reason).
-       comp/blast are either dict-records or None."""
-    has_c = comp is not None and comp["bird_gene"]
-    has_b = blast is not None and blast["bird_gene"]
-    # Ensembl Compara returns "ortholog_one2one", "ortholog_one2many" etc.
-    # Normalise by stripping the "ortholog_" prefix for comparisons below.
-    if comp is not None and comp.get("type"):
-        comp = {**comp, "type": comp["type"].replace("ortholog_", "")}
-
-    # both methods saw this (gene,species) but neither found an ortholog
-    if comp is not None and blast is not None and not has_c and not has_b:
-        return "NO_ORTHOLOG", "SKIP", "neither method returned a bird ortholog"
-
-    # one of the tables didn't cover this pair at all
-    if comp is None and blast is None:
-        return "NO_DATA_BOTH", "SKIP", "no data in either input"
-    if comp is None and has_b:
-        return "NO_DATA_COMPARA", f"BLAST:{blast['bird_gene']}", "BLAST only (Compara not provided)"
-    if blast is None and has_c:
-        return "NO_DATA_BLAST", f"COMPARA:{comp['bird_gene']}", "Compara only (BLAST not provided)"
-    if comp is None and not has_b:
-        return "NO_DATA_COMPARA", "SKIP", "BLAST empty; Compara not provided"
-    if blast is None and not has_c:
-        return "NO_DATA_BLAST", "SKIP", "Compara empty; BLAST not provided"
-
-    # only one method found something (both tables present)
-    if has_c and not has_b:
-        ctype = comp["type"]
-        if ctype == "one2one":
-            return "COMPARA_ONLY", f"COMPARA:{comp['bird_gene']}", "Compara one2one; RBB silent"
-        if ctype in ("one2many", "many2many", "many2one"):
-            return "COMPARA_ONLY", f"COMPARA:{comp['bird_gene']}*", f"Compara {ctype} (lower conf); RBB silent"
-        return "COMPARA_ONLY", f"COMPARA:{comp['bird_gene']}*", "Compara only (type unknown); RBB silent"
-
-    if has_b and not has_c:
-        return "BLAST_ONLY", f"BLAST:{blast['bird_gene']}", "RBB only (e.g. T2T, or paralog-rich)"
-
-    # both found something.
-    # Compara returns Ensembl IDs (ENSGALG..., ENSAPLG...);
-    # RBB returns RefSeq accessions (ref|XP_...|).
-    # These namespaces never overlap, so string equality is the wrong test.
-    # Instead: if both methods return ANY hit, treat as CONCORDANT --
-    # both independently confirm the ortholog exists at this locus.
-    # Record both IDs; use Compara as canonical for chicken/ZJU (Ensembl GFFs),
-    # RBB as canonical for T2T (RefSeq GFF, no Compara coverage).
-    if comp["bird_gene"] == blast["bird_gene"]:
-        # same namespace (shouldn't happen normally, but handle it)
-        return "AGREE", f"COMPARA:{comp['bird_gene']}", "methods concordant (same ID)"
-
-    # different namespaces -- both confirmed, use Compara as canonical
-    if comp["type"] == "one2one":
-        return ("CONCORDANT",
-                f"COMPARA:{comp['bird_gene']}",
-                f"both methods confirm ortholog; Compara one2one canonical (RBB: {blast['bird_gene']})")
-    if comp["type"] in ("one2many", "many2many", "many2one"):
-        return ("CONCORDANT",
-                f"COMPARA:{comp['bird_gene']}*",
-                f"both methods confirm ortholog; Compara {comp['type']} flagged (RBB: {blast['bird_gene']})")
-    # unknown type but both hit -- still concordant, flag it
-    return ("CONCORDANT",
-            f"COMPARA:{comp['bird_gene']}*",
-            f"both methods confirm ortholog; Compara type unknown (RBB: {blast['bird_gene']})")
-
-
-# ---------- reconcile ----------
-
-def reconcile(compara_rows, blast_rows):
-    """Return list of output dicts, one per (human_gene, species) seen in either input."""
-    cidx = index_compara(compara_rows)
-    bidx = index_blast(blast_rows)
-    keys = sorted(set(cidx) | set(bidx))
-
-    # was each table provided at all? (controls NO_DATA_* semantics)
-    compara_provided = compara_rows is not None and len(compara_rows) >= 0  # truthy if file given
-    blast_provided   = blast_rows   is not None and len(blast_rows)   >= 0
-
-    out = []
-    for k in keys:
-        gene, species = k
-        comp_rec  = cidx.get(k) if compara_provided else None
-        blast_rec = bidx.get(k) if blast_provided   else None
-
-        # if a table was provided but this key isn't in it, that's an empty record
-        # (i.e. the method ran for this pair and returned nothing), not "no data"
-        if compara_provided and comp_rec is None:
-            comp_rec = {"bird_gene": "", "type": "", "identity": ""}
-        if blast_provided and blast_rec is None:
-            blast_rec = {"bird_gene": "", "identity": "", "evalue": "", "qcov": ""}
-
-        conc, use, reason = classify(comp_rec, blast_rec)
-        out.append({
-            "human_gene":       gene,
-            "species":          species,
-            "compara_bird_gene": (comp_rec or {}).get("bird_gene", ""),
-            "compara_type":      (comp_rec or {}).get("type", ""),
-            "compara_identity":  (comp_rec or {}).get("identity", ""),
-            "blast_bird_gene":   (blast_rec or {}).get("bird_gene", ""),
-            "blast_identity":    (blast_rec or {}).get("identity", ""),
-            "blast_evalue":      (blast_rec or {}).get("evalue", ""),
-            "blast_qcov":        (blast_rec or {}).get("qcov", ""),
-            "concordance":       conc,
-            "use_for_synteny":   use,
-            "reason":            reason,
-        })
+        reader = csv.DictReader(fh, delimiter='\t')
+        for r in reader:
+            key = (r['human_gene'], r['species'])
+            out[key] = {
+                'bird_gene': r['bird_gene'],
+                'ortholog_type': normalise_compara_type(r['ortholog_type']),
+                'identity': r.get('identity', '0'),
+            }
     return out
 
 
-# ---------- CLI ----------
-
-OUT_COLS = ["human_gene", "species",
-            "compara_bird_gene", "compara_type", "compara_identity",
-            "blast_bird_gene", "blast_identity", "blast_evalue", "blast_qcov",
-            "concordance", "use_for_synteny", "reason"]
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(description="Reconcile Compara + RBB BLAST ortholog tables for flanker genes")
-    p.add_argument("--compara", help="Compara ortholog TSV (human_gene, species, bird_gene, ortholog_type, identity)")
-    p.add_argument("--blast",   help="Reciprocal-best-BLAST TSV (human_gene, species, bird_gene, identity, evalue, qcov)")
-    p.add_argument("-o", "--out", required=True, help="Output reconciled TSV")
-    a = p.parse_args(argv)
-
-    if not a.compara and not a.blast:
-        sys.exit("ERROR: provide at least one of --compara / --blast")
-
-    comp = _read_tsv(a.compara, ["human_gene", "species", "bird_gene", "ortholog_type", "identity"]) if a.compara else None
-    blast = _read_tsv(a.blast,  ["human_gene", "species", "bird_gene", "identity", "evalue", "qcov"]) if a.blast   else None
-
-    rows = reconcile(comp, blast)
-    with open(a.out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=OUT_COLS, delimiter="\t")
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-    # quick stdout summary by concordance category
-    summary = defaultdict(int)
-    for r in rows:
-        summary[r["concordance"]] += 1
-    print(f"# reconciled {len(rows)} (gene, species) pairs -> {a.out}", file=sys.stderr)
-    for k in sorted(summary):
-        print(f"#   {k:18} {summary[k]}", file=sys.stderr)
-    return 0
+def load_blast(path):
+    """{(human_gene, species): row}  -- new v3 schema"""
+    if not path:
+        return {}
+    out = {}
+    with open(path) as fh:
+        reader = csv.DictReader(fh, delimiter='\t')
+        for r in reader:
+            key = (r['human_gene'], r['species'])
+            out[key] = {
+                'forward_top_hit':  r.get('forward_top_hit', ''),
+                'forward_pident':   r.get('forward_pident', ''),
+                'forward_qcov':     r.get('forward_qcov', ''),
+                'reverse_symbol':   r.get('reverse_symbol', ''),
+                'reciprocal_match': r.get('reciprocal_match', ''),
+                'tblastn_seqid':    r.get('tblastn_seqid', ''),
+                'tblastn_pident':   r.get('tblastn_pident', ''),
+            }
+    return out
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def classify(compara_rec, blast_rec, human_gene):
+    """Return (concordance, use_for_synteny, reason)."""
+    has_compara = compara_rec and compara_rec['bird_gene']
+    has_blast_reciprocal = (
+        blast_rec
+        and blast_rec.get('forward_top_hit')
+        and blast_rec.get('reciprocal_match') == 'YES'
+    )
+    has_blast_paralog = (
+        blast_rec
+        and blast_rec.get('forward_top_hit')
+        and blast_rec.get('reciprocal_match') == 'NO'
+    )
+    has_tblastn = blast_rec and blast_rec.get('tblastn_seqid')
+
+    if has_compara and has_blast_reciprocal:
+        ctype = compara_rec['ortholog_type']
+        compara_gene = compara_rec['bird_gene']
+        blast_gene = blast_rec['forward_top_hit']
+        if compara_gene == blast_gene:
+            concordance = 'AGREE'
+        else:
+            concordance = 'CONCORDANT'
+        if ctype in COMPARA_HIGH_CONF:
+            use = f'COMPARA:{compara_gene}'
+            reason = f'compara {ctype}, blastp reciprocal confirms (top hit {blast_gene})'
+        elif ctype in COMPARA_LOW_CONF:
+            use = f'COMPARA:{compara_gene}*'
+            reason = f'compara {ctype} (low conf), blastp reciprocal confirms'
+        else:
+            use = f'COMPARA:{compara_gene}*'
+            reason = f'compara type unknown ({ctype}), blastp reciprocal confirms'
+        return concordance, use, reason
+
+    if has_compara and not has_blast_reciprocal:
+        ctype = compara_rec['ortholog_type']
+        compara_gene = compara_rec['bird_gene']
+        if ctype in COMPARA_HIGH_CONF:
+            use = f'COMPARA:{compara_gene}'
+            reason = f'compara {ctype}, blastp silent or paralog'
+        elif ctype in COMPARA_LOW_CONF:
+            use = f'COMPARA:{compara_gene}*'
+            reason = f'compara {ctype} only'
+        else:
+            use = f'COMPARA:{compara_gene}*'
+            reason = f'compara type unknown ({ctype})'
+        return 'COMPARA_ONLY', use, reason
+
+    if has_blast_reciprocal:
+        bg = blast_rec['forward_top_hit']
+        return ('RECIPROCAL_ONLY',
+                f'BLAST:{bg}',
+                f'blastp reciprocal best hit')
+
+    if has_blast_paralog:
+        bg = blast_rec['forward_top_hit']
+        rev = blast_rec.get('reverse_symbol', '')
+        return ('PARALOG_FLANKER',
+                f'BLAST:{bg}~{rev}',
+                f'top blastp hit is paralog (reverses to {rev}); positional use only')
+
+    if has_tblastn:
+        seqid = blast_rec['tblastn_seqid']
+        pident = blast_rec.get('tblastn_pident', '')
+        return ('GENOME_HIT',
+                'SKIP',
+                f'tblastn hit at {seqid} ({pident}%); unannotated, synteny lookup-by-coord not implemented')
+
+    return 'NO_ORTHOLOG', 'SKIP', 'no evidence in compara, blastp, or tblastn'
+
+
+def reconcile(compara_path, blast_path, out_path):
+    compara = load_compara(compara_path)
+    blast = load_blast(blast_path)
+
+    all_keys = sorted(set(compara) | set(blast))
+
+    out_cols = [
+        'human_gene', 'species',
+        'compara_bird_gene', 'compara_type', 'compara_identity',
+        'blast_forward_top_hit', 'blast_forward_pident', 'blast_forward_qcov',
+        'blast_reverse_symbol', 'blast_reciprocal',
+        'tblastn_seqid', 'tblastn_pident',
+        'concordance', 'use_for_synteny', 'reason',
+    ]
+
+    counts = {}
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=out_cols, delimiter='\t')
+        writer.writeheader()
+        for human_gene, species in all_keys:
+            compara_rec = compara.get((human_gene, species))
+            blast_rec = blast.get((human_gene, species))
+            concordance, use, reason = classify(compara_rec, blast_rec, human_gene)
+            row = {
+                'human_gene': human_gene,
+                'species': species,
+                'compara_bird_gene': compara_rec['bird_gene'] if compara_rec else '',
+                'compara_type': compara_rec['ortholog_type'] if compara_rec else '',
+                'compara_identity': compara_rec['identity'] if compara_rec else '',
+                'blast_forward_top_hit': blast_rec['forward_top_hit'] if blast_rec else '',
+                'blast_forward_pident': blast_rec.get('forward_pident', '') if blast_rec else '',
+                'blast_forward_qcov': blast_rec.get('forward_qcov', '') if blast_rec else '',
+                'blast_reverse_symbol': blast_rec.get('reverse_symbol', '') if blast_rec else '',
+                'blast_reciprocal': blast_rec.get('reciprocal_match', '') if blast_rec else '',
+                'tblastn_seqid': blast_rec.get('tblastn_seqid', '') if blast_rec else '',
+                'tblastn_pident': blast_rec.get('tblastn_pident', '') if blast_rec else '',
+                'concordance': concordance,
+                'use_for_synteny': use,
+                'reason': reason,
+            }
+            writer.writerow(row)
+            counts[concordance] = counts.get(concordance, 0) + 1
+
+    print(f'# reconciled {len(all_keys)} (gene, species) pairs -> {out_path}', file=sys.stderr)
+    for cat in sorted(counts):
+        print(f'#   {cat:18} {counts[cat]}', file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(description='Reconcile flanker ortholog evidence v3')
+    p.add_argument('--compara', help='compara.tsv from build_flanker_inputs.sh')
+    p.add_argument('--blast', help='blast_v3.tsv from build_flanker_inputs.sh')
+    p.add_argument('-o', '--out', required=True, help='reconciled output TSV')
+    a = p.parse_args()
+    reconcile(a.compara, a.blast, a.out)
+
+
+if __name__ == '__main__':
+    main()
