@@ -1,0 +1,23 @@
+common_name	species	ncbi_taxid	group	notes
+human	Homo sapiens	9606	mammal	reference scaffold
+mouse	Mus musculus	10090	mammal	reference scaffold
+cow	Bos taurus	9913	mammal	
+cat	Felis catus	9685	mammal	replaces dog (dog lacks MLKL)
+bat	Pteropus vampyrus	132908	mammal	fruit bat; viral-tolerant
+pig	Sus scrofa	9823	mammal	
+opossum	Monodelphis domestica	13616	mammal	marsupial outgroup
+platypus	Ornithorhynchus anatinus	9258	mammal	monotreme; mammal-bird bridge
+chicken	Gallus gallus	9031	bird	susceptible comparator
+duck	Anas platyrhynchos	8839	bird	tolerant comparator
+turkey	Meleagris gallopavo	9103	bird	galliform
+quail	Coturnix japonica	93934	bird	galliform
+goose	Anser cygnoides	8845	bird	anseriform
+zebra_finch	Taeniopygia guttata	59729	bird	passerine
+great_tit	Parus major	9157	bird	passerine
+pigeon	Columba livia	8932	bird	columbiform
+eagle	Haliaeetus leucocephalus	52644	bird	raptor
+emu	Dromaius novaehollandiae	8790	bird	ratite basal
+ostrich	Struthio camelus	8801	bird	ratite
+penguin	Aptenodytes forsteri	9233	bird	waterbird
+green_anole	Anolis carolinensis	28377	reptile	outgroup
+alligator	Alligator mississippiensis	8496	reptile	archosaur; sister to birds
